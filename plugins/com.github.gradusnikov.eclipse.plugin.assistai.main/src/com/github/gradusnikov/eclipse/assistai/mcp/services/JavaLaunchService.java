@@ -41,7 +41,6 @@ import org.eclipse.debug.core.model.IThread;
 import org.eclipse.debug.core.model.IVariable;
 import org.eclipse.e4.core.di.annotations.Creatable;
 import org.eclipse.e4.ui.di.UISynchronize;
-import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
@@ -70,6 +69,7 @@ import com.github.gradusnikov.eclipse.assistai.mcp.results.StackTraceResponse;
 import com.github.gradusnikov.eclipse.assistai.mcp.results.StepResponse;
 import com.github.gradusnikov.eclipse.assistai.mcp.results.StopApplicationResponse;
 import com.github.gradusnikov.eclipse.assistai.tools.LineOffsets;
+import com.github.gradusnikov.eclipse.assistai.tools.TypeSource;
 
 import jakarta.inject.Inject;
 
@@ -774,20 +774,15 @@ public class JavaLaunchService
 
     /**
      * How many lines the type's source has, or -1 when there is no source to measure - a
-     * binary type with no attachment. Counted by {@link LineOffsets}, whose line tracker
-     * handles CRLF, rather than by splitting on '\n'.
+     * binary type whose classpath entry attaches none.
+     * Counted by {@link LineOffsets}, whose line tracker handles CRLF, rather than by splitting on '\n'.
      */
     private int typeSourceLineCount( IType type )
     {
         try
         {
-            ICompilationUnit unit = type.getCompilationUnit();
-            if ( unit == null )
-            {
-                return -1;
-            }
-            String source = unit.getSource();
-            return source == null ? -1 : LineOffsets.countLines( source );
+            TypeSource source = TypeSource.of( type );
+            return source == null ? -1 : LineOffsets.countLines( source.contents() );
         }
         catch ( CoreException e )
         {

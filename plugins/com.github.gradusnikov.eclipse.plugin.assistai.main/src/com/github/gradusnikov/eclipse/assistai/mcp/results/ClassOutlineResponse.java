@@ -2,6 +2,8 @@ package com.github.gradusnikov.eclipse.assistai.mcp.results;
 
 import java.util.List;
 
+import com.github.gradusnikov.eclipse.assistai.resources.SourceOrigin;
+
 /**
  * The members of a Java type and where each one starts and ends.
  * <p>
@@ -14,7 +16,14 @@ import java.util.List;
  * {@code projectName} and {@code filePath} are the pair {@code readProjectResource} and
  * the editing tools take, so a member can be read with
  * {@code readProjectResource(projectName, filePath, startLine, endLine)} without a
- * second lookup.
+ * second lookup. A type out of a JAR has neither, and its members are read with
+ * {@code getSource(typeName, startLine, endLine)} instead; {@code origin} says which of
+ * the two a caller is holding, and so also whether an edit is possible at all.
+ * <p>
+ * {@code origin} is {@code DECOMPILED_CLASS} for a binary type with no source at all,
+ * which is still outlined: the class file knows its own members, so the signatures are
+ * exact, and only the line ranges and the documentation are missing. Every range is 0
+ * there, and the only way to read a body is {@code getSource}, which decompiles.
  * <p>
  * Each entry also carries its Javadoc, rendered the way the IDE's hover renders it - by
  * default the first sentence, which is what turns a list of signatures into an overview
@@ -25,6 +34,7 @@ public record ClassOutlineResponse(
     Status status,
     String projectName,
     String filePath,
+    SourceOrigin origin,
     Member declaration,
     List<Member> fields,
     List<Member> methods,
@@ -38,7 +48,11 @@ public record ClassOutlineResponse(
         OK,
         /** No open Java project knows this type. */
         TYPE_NOT_FOUND,
-        /** The type is a class file with no attached source; use getSource, which decompiles. */
+        /**
+         * No source could be read where there should have been some - a compilation unit
+         * with no readable buffer. A class file needs no source to be outlined, so it
+         * reports OK with an origin of DECOMPILED_CLASS rather than this.
+         */
         NO_SOURCE,
         /** The file is excluded from AI processing by .aiignore. */
         ACCESS_DENIED
@@ -51,8 +65,11 @@ public record ClassOutlineResponse(
      * @param label the declaration as it reads in source - annotations, modifiers,
      *            types and, for a method, its parameters - with no body
      * @param startLine 1-based, inclusive, counted by the platform's line tracker so a
-     *            CRLF file reports the same lines as an LF one
-     * @param endLine 1-based, inclusive; equal to {@code startLine} for a one-line member
+     *            CRLF file reports the same lines as an LF one; 0 for a member with no
+     *            source to point at, which in a binary type means one the attachment does
+     *            not contain - a generated constructor, a bridge or synthetic method
+     * @param endLine 1-based, inclusive; equal to {@code startLine} for a one-line member,
+     *            and 0 wherever {@code startLine} is
      * @param javadoc the member's documentation as Markdown at the requested detail - the
      *            first sentence, or the whole comment - or null when none was requested
      *            or the member has none, its own or inherited
@@ -69,27 +86,30 @@ public record ClassOutlineResponse(
         boolean javadocInherited
     )
     {
-        /** How many lines reading this member costs, which is what a caller budgets against. */
+        /** How many lines reading this member costs, which is what a caller budgets against; 0 when it has no source. */
         public int lineCount()
         {
-            return endLine - startLine + 1;
+            return startLine <= 0 ? 0 : endLine - startLine + 1;
         }
     }
 
     public static ClassOutlineResponse failed( String typeName, Status status, String summary )
     {
-        return new ClassOutlineResponse( typeName, status, null, null, null,
+        return new ClassOutlineResponse( typeName, status, null, null, null, null,
                 List.of(), List.of(), List.of(), summary );
     }
 
     public static ClassOutlineResponse of( String typeName, String projectName, String filePath,
-            Member declaration, List<Member> fields, List<Member> methods, List<Member> innerTypes )
+            SourceOrigin origin, Member declaration, List<Member> fields, List<Member> methods,
+            List<Member> innerTypes )
     {
+        String extent = declaration.startLine() > 0
+                ? "lines " + declaration.startLine() + "-" + declaration.endLine() + "."
+                : "signatures only - no source is attached, so no member carries a line range.";
         String summary = typeName + ": " + fields.size() + " fields, " + methods.size() + " methods, "
-                + innerTypes.size() + " inner types, lines " + declaration.startLine() + "-"
-                + declaration.endLine() + ".";
+                + innerTypes.size() + " inner types, " + extent;
 
-        return new ClassOutlineResponse( typeName, Status.OK, projectName, filePath, declaration,
+        return new ClassOutlineResponse( typeName, Status.OK, projectName, filePath, origin, declaration,
                 fields, methods, innerTypes, summary );
     }
 }

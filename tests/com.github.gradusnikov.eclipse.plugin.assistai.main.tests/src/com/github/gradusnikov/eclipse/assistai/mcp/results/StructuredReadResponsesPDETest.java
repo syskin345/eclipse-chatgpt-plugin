@@ -14,6 +14,7 @@ import com.github.gradusnikov.eclipse.assistai.mcp.McpJson;
 import com.github.gradusnikov.eclipse.assistai.mcp.McpOutputSchemas;
 import com.github.gradusnikov.eclipse.assistai.resources.ContentRange;
 import com.github.gradusnikov.eclipse.assistai.resources.ResourceVersion;
+import com.github.gradusnikov.eclipse.assistai.resources.SourceOrigin;
 
 /**
  * The four records batch 2 added for results that are not a plain file read:
@@ -64,7 +65,7 @@ public class StructuredReadResponsesPDETest
     private static MethodSourceResponse aMethodRead()
     {
         return MethodSourceResponse.of( "com.example.Repo", "P", "src/com/example/Repo.java",
-                new ResourceVersion( 4711L, 1700000000000L, null, true ),
+                SourceOrigin.WORKSPACE_SOURCE, new ResourceVersion( 4711L, 1700000000000L, null, true ),
                 List.of( new MethodSourceResponse.MethodSource( "findById", "String id",
                         new ContentRange( 40, 1, 47, 1 ), "public Row findById( String id )\n{\n}\n" ) ),
                 List.of( "save" ) );
@@ -107,7 +108,7 @@ public class StructuredReadResponsesPDETest
     public void methodSourceIsOkOnlyWhenNothingWasMissed()
     {
         MethodSourceResponse response = MethodSourceResponse.of( "com.example.Repo", "P", "src/Repo.java",
-                ResourceVersion.UNKNOWN, List.of(), List.of() );
+                SourceOrigin.WORKSPACE_SOURCE, ResourceVersion.UNKNOWN, List.of(), List.of() );
 
         assertEquals( MethodSourceResponse.Status.OK, response.status() );
         assertTrue( response.notFound().isEmpty() );

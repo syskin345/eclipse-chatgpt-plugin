@@ -23,6 +23,9 @@ import org.eclipse.jdt.core.IMethod;
 import org.eclipse.jdt.core.ISourceRange;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaCore;
+import org.eclipse.jdt.core.JavaModelException;
+import org.eclipse.jdt.core.SourceRange;
+import org.eclipse.jface.text.BadLocationException;
 import org.eclipse.jface.text.Document;
 
 import com.github.gradusnikov.eclipse.assistai.mcp.results.Diagnostic;
@@ -32,8 +35,8 @@ import com.github.gradusnikov.eclipse.assistai.resources.ContentRange;
 import com.github.gradusnikov.eclipse.assistai.resources.ResourceDescriptor;
 import com.github.gradusnikov.eclipse.assistai.resources.ResourceReadResult;
 import com.github.gradusnikov.eclipse.assistai.resources.ResourceVersion;
-import com.github.gradusnikov.eclipse.assistai.resources.SourceOrigin;
 import com.github.gradusnikov.eclipse.assistai.services.AiIgnoreService;
+import com.github.gradusnikov.eclipse.assistai.tools.TypeSource;
 
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
@@ -107,21 +110,22 @@ public class OutlineService
                     continue;
                 }
 
-                ICompilationUnit cu = type.getCompilationUnit();
-                if ( cu == null )
+                TypeSource typeSource = TypeSource.of( type );
+                if ( typeSource == null )
                 {
+                    // This project resolves the type to bytecode with no source attached; another may attach some.
                     continue;
                 }
 
-                IResource resource = cu.getResource();
-                if ( resource != null && aiIgnoreService.isExcluded( resource ) )
+                IFile file = typeSource.file();
+                if ( file != null && aiIgnoreService.isExcluded( file ) )
                 {
                     return MethodSourceResponse.failed( fullyQualifiedClassName, Diagnostic.fatal(
                             DiagnosticCode.RESOURCE_NOT_ACCESSIBLE,
                             "'" + fullyQualifiedClassName + "' is excluded from AI processing by .aiignore." ) );
                 }
 
-                String source = cu.getBuffer().getContents();
+                String source = typeSource.contents();
                 Document doc = new Document( source );
 
                 List<MethodSourceResponse.MethodSource> found = new ArrayList<>();
@@ -141,9 +145,16 @@ public class OutlineService
                         continue;
                     }
 
+                    ISourceRange range = method.getSourceRange();
+                    if ( !SourceRange.isAvailable( range ) )
+                    {
+                        // A binary member the attachment does not contain - a generated constructor, a bridge
+                        // method. There is no source to return, so it stays in notFound rather than coming back empty.
+                        continue;
+                    }
+
                     notFound.remove( method.getElementName() );
 
-                    ISourceRange range = method.getSourceRange();
                     int startOffset = range.getOffset();
                     int endOffset = startOffset + range.getLength();
 
@@ -186,11 +197,11 @@ public class OutlineService
                             source.substring( from, to ) ) );
                 }
 
-                IFile file = resource instanceof IFile f ? f : null;
                 return MethodSourceResponse.of(
                         fullyQualifiedClassName,
                         file == null ? null : file.getProject().getName(),
                         file == null ? null : file.getProjectRelativePath().toString(),
+                        typeSource.origin(),
                         ResourceVersion.of( file ),
                         found,
                         notFound );
@@ -203,7 +214,8 @@ public class OutlineService
 
         return MethodSourceResponse.failed( fullyQualifiedClassName, Diagnostic.fatal(
                 DiagnosticCode.RESOURCE_NOT_FOUND,
-                "No open Java project resolves the type '" + fullyQualifiedClassName + "' to source." ) );
+                "No open Java project resolves the type '" + fullyQualifiedClassName + "' to source,"
+                        + " in the workspace or attached to a library." ) );
     }
 
     /**
@@ -214,7 +226,9 @@ public class OutlineService
      * {@link ResourceReadResult} describes: the content is exact, and every omission
      * is a range in {@code omittedRanges} rather than a {@code // ... (lines 40-91)}
      * comment spliced into the code. A caller that wants an omitted region reads it
-     * with {@code readProjectResource(projectName, filePath, startLine, endLine)}.
+     * with {@code readProjectResource(projectName, filePath, startLine, endLine)}, or -
+     * for a type out of a JAR, which has neither - with
+     * {@code getSource(fullyQualifiedClassName, startLine, endLine)}.
      *
      * @param methodNames comma-separated method names to expand; null or empty expands
      *            all of them, in which case only the imports can be omitted
@@ -242,21 +256,22 @@ public class OutlineService
                     continue;
                 }
 
-                ICompilationUnit cu = type.getCompilationUnit();
-                if ( cu == null )
+                TypeSource typeSource = TypeSource.of( type );
+                if ( typeSource == null )
                 {
+                    // This project resolves the type to bytecode with no source attached; another may attach some.
                     continue;
                 }
 
-                IResource resource = cu.getResource();
-                if ( resource != null && aiIgnoreService.isExcluded( resource ) )
+                IFile file = typeSource.file();
+                if ( file != null && aiIgnoreService.isExcluded( file ) )
                 {
-                    return ResourceReadResult.failed( projectNameOf( resource ), pathOf( resource ),
+                    return ResourceReadResult.failed( projectNameOf( file ), pathOf( file ),
                             Diagnostic.fatal( DiagnosticCode.RESOURCE_NOT_ACCESSIBLE, "'"
                                     + fullyQualifiedClassName + "' is excluded from AI processing by .aiignore." ) );
                 }
 
-                String source = cu.getBuffer().getContents();
+                String source = typeSource.contents();
                 String[] lines = source.split( "\n", -1 );
                 Document doc = new Document( source );
 
@@ -265,12 +280,10 @@ public class OutlineService
 
                 if ( excludeImports )
                 {
-                    IImportContainer importContainer = cu.getImportContainer();
-                    if ( importContainer != null && importContainer.exists() )
+                    LineSpan imports = importLines( typeSource, type, lines, doc );
+                    if ( imports != null )
                     {
-                        ISourceRange importRange = importContainer.getSourceRange();
-                        omit.put( doc.getLineOfOffset( importRange.getOffset() ) + 1,
-                                  doc.getLineOfOffset( importRange.getOffset() + importRange.getLength() - 1 ) + 1 );
+                        omit.put( imports.start(), imports.end() );
                     }
                 }
 
@@ -332,21 +345,20 @@ public class OutlineService
                 }
 
                 int totalLines = lines.length;
-                IFile file = resource instanceof IFile f ? f : null;
 
                 return new ResourceReadResult(
                         omittedRanges.isEmpty() ? ResourceReadResult.ReadStatus.OK
                                                 : ResourceReadResult.ReadStatus.PARTIAL,
                         ResourceDescriptor.fromJavaType( type, toolName ).uri().toString(),
-                        projectNameOf( resource ),
-                        pathOf( resource ),
+                        projectNameOf( file ),
+                        pathOf( file ),
                         "java",
                         ResourceVersion.of( file ),
                         new ContentRange( 1, 1, Math.max( 1, totalLines ), 1 ),
                         totalLines,
                         content.toString(),
-                        SourceOrigin.WORKSPACE_SOURCE,
-                        false,
+                        typeSource.origin(),
+                        !typeSource.origin().isEditable(),
                         // Nothing was cut off the end: the content runs to the last
                         // line, with holes. The holes are omittedRanges.
                         false,
@@ -361,7 +373,53 @@ public class OutlineService
 
         return ResourceReadResult.failed( null, null, Diagnostic.fatal(
                 DiagnosticCode.RESOURCE_NOT_FOUND,
-                "No open Java project resolves the type '" + fullyQualifiedClassName + "' to source." ) );
+                "No open Java project resolves the type '" + fullyQualifiedClassName + "' to source,"
+                        + " in the workspace or attached to a library." ) );
+    }
+
+    /** A run of whole lines, 1-based and inclusive. */
+    private record LineSpan( int start, int end )
+    {
+    }
+
+    /**
+     * The import block's first and last line, or null when the type has no imports.
+     * <p>
+     * JDT models an import container for a compilation unit only, so attached source is
+     * read as text instead. The scan stops at the type declaration, which is what keeps
+     * a line inside a method body from being taken for an import.
+     */
+    private static LineSpan importLines( TypeSource typeSource, IType type, String[] lines, Document doc )
+            throws JavaModelException, BadLocationException
+    {
+        ICompilationUnit cu = typeSource.compilationUnit();
+        if ( cu != null )
+        {
+            IImportContainer importContainer = cu.getImportContainer();
+            if ( importContainer == null || !importContainer.exists() )
+            {
+                return null;
+            }
+            ISourceRange importRange = importContainer.getSourceRange();
+            return new LineSpan( doc.getLineOfOffset( importRange.getOffset() ) + 1,
+                    doc.getLineOfOffset( importRange.getOffset() + importRange.getLength() - 1 ) + 1 );
+        }
+
+        ISourceRange typeRange = type.getSourceRange();
+        int declarationLine = typeRange == null || typeRange.getOffset() < 0
+                ? lines.length
+                : doc.getLineOfOffset( typeRange.getOffset() );
+        int first = -1;
+        int last = -1;
+        for ( int i = 0; i < Math.min( declarationLine, lines.length ); i++ )
+        {
+            if ( lines[i].strip().startsWith( "import " ) )
+            {
+                first = first < 0 ? i : first;
+                last = i;
+            }
+        }
+        return first < 0 ? null : new LineSpan( first + 1, last + 1 );
     }
 
     private static String projectNameOf( IResource resource )

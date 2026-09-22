@@ -4,6 +4,7 @@ import java.util.List;
 
 import com.github.gradusnikov.eclipse.assistai.resources.ContentRange;
 import com.github.gradusnikov.eclipse.assistai.resources.ResourceVersion;
+import com.github.gradusnikov.eclipse.assistai.resources.SourceOrigin;
 
 /**
  * The source of one or more named methods of a single Java type.
@@ -24,6 +25,9 @@ import com.github.gradusnikov.eclipse.assistai.resources.ResourceVersion;
  * used to be a trailing {@code // Not found: a, b} comment appended to the source,
  * which meant the only way to discover it was to read the code the tool returned.
  *
+ * @param origin where the text came from. A type out of a JAR with a source attachment
+ *            reads exactly like one in the workspace, and only this says that the lines
+ *            it reports cannot be edited and carry no project or file
  * @param version the version the source was taken at; its {@code modificationStamp} is
  *            what an edit built from this read passes as
  *            {@code expectedModificationStamp}
@@ -35,6 +39,7 @@ public record MethodSourceResponse(
     String className,
     String projectName,
     String filePath,
+    SourceOrigin origin,
     ResourceVersion version,
     List<MethodSource> methods,
     List<String> notFound,
@@ -80,7 +85,7 @@ public record MethodSourceResponse(
     /** Nothing could be read; the reason is a code rather than a sentence. */
     public static MethodSourceResponse failed( String className, Diagnostic diagnostic )
     {
-        return new MethodSourceResponse( Status.FAILED, className, null, null,
+        return new MethodSourceResponse( Status.FAILED, className, null, null, null,
                 ResourceVersion.UNKNOWN, List.of(), List.of(), List.of( diagnostic ) );
     }
 
@@ -90,12 +95,12 @@ public record MethodSourceResponse(
      * compare two list sizes to notice.
      */
     public static MethodSourceResponse of( String className, String projectName, String filePath,
-                                           ResourceVersion version, List<MethodSource> methods,
-                                           List<String> notFound )
+                                           SourceOrigin origin, ResourceVersion version,
+                                           List<MethodSource> methods, List<String> notFound )
     {
         return new MethodSourceResponse(
                 notFound.isEmpty() ? Status.OK : Status.PARTIAL,
-                className, projectName, filePath, version,
+                className, projectName, filePath, origin, version,
                 List.copyOf( methods ), List.copyOf( notFound ), Diagnostic.none() );
     }
 }

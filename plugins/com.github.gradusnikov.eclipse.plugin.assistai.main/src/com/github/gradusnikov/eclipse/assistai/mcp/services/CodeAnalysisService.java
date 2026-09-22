@@ -31,8 +31,10 @@ import com.github.gradusnikov.eclipse.assistai.mcp.results.ImportSuggestionsResp
 import com.github.gradusnikov.eclipse.assistai.mcp.results.QuickFixResponse;
 import com.github.gradusnikov.eclipse.assistai.mcp.results.ReferencesResponse;
 import com.github.gradusnikov.eclipse.assistai.mcp.results.TypeHierarchyResponse;
+import com.github.gradusnikov.eclipse.assistai.resources.SourceOrigin;
 import com.github.gradusnikov.eclipse.assistai.tools.Javadocs;
 import com.github.gradusnikov.eclipse.assistai.tools.LineOffsets;
+import com.github.gradusnikov.eclipse.assistai.tools.TypeSource;
 import org.eclipse.e4.core.di.annotations.Creatable;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.IAnnotation;
@@ -49,6 +51,7 @@ import org.eclipse.jdt.core.ITypeParameter;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.Signature;
+import org.eclipse.jdt.core.SourceRange;
 import org.eclipse.jface.text.BadLocationException;
 import org.eclipse.jface.text.Document;
 import org.eclipse.jface.text.IDocument;
@@ -556,6 +559,42 @@ public class CodeAnalysisService
     }
 
     /**
+     * Resolves a type name, preferring a project whose copy of it has source.
+     * <p>
+     * One name can resolve in several projects to different copies - a JAR with a source
+     * attachment in one, a bare JAR in another - and {@link #findType} takes whichever
+     * comes first. That is right where the answer is about a particular copy, as it is for
+     * a hierarchy or a reference search, and wrong for reading: an outline of the copy that
+     * has source carries line ranges and documentation, and the same outline off bytecode
+     * carries neither. This keeps the reading tools on one copy, since
+     * {@code OutlineService} already searches on past a copy it cannot read.
+     *
+     * @return the first resolution that has source, else the first resolution of any kind,
+     *         else null when no open project knows the name
+     */
+    private IType findTypeToRead( String fullyQualifiedClassName ) throws JavaModelException
+    {
+        IType firstFound = null;
+        for ( IJavaProject project : getAvailableJavaProjects() )
+        {
+            IType type = project.findType( fullyQualifiedClassName );
+            if ( type == null )
+            {
+                continue;
+            }
+            if ( TypeSource.of( type ) != null )
+            {
+                return type;
+            }
+            if ( firstFound == null )
+            {
+                firstFound = type;
+            }
+        }
+        return firstFound;
+    }
+
+    /**
      * Retrieves the superclasses, implemented interfaces and subtypes of a type.
      * <p>
      * The three relations are kept apart rather than folded into one indented listing,
@@ -627,6 +666,11 @@ public class CodeAnalysisService
      * The line range is the point of the call. A caller reads an outline to choose one
      * member and then fetch it, so an entry that named a member without saying where it
      * ends left that caller guessing its extent from the start of the next one.
+     * <p>
+     * A type out of a JAR with a source attachment is outlined the same way, and
+     * {@code origin} is what tells the two apart: the lines of workspace source are read
+     * back with {@code readProjectResource}, and the lines of attached source - which has
+     * no project and no file - with {@code getSource(fullyQualifiedClassName, startLine, endLine)}.
      *
      * @param fullyQualifiedClassName the type to outline
      * @param includeFields whether field declarations are listed
@@ -637,21 +681,23 @@ public class CodeAnalysisService
     {
         try
         {
-            IType type = findType( fullyQualifiedClassName );
+            IType type = findTypeToRead( fullyQualifiedClassName );
             if ( type == null )
             {
                 return ClassOutlineResponse.failed( fullyQualifiedClassName, ClassOutlineResponse.Status.TYPE_NOT_FOUND,
                         "Type '" + fullyQualifiedClassName + "' was not found in any open Java project." );
             }
 
-            ICompilationUnit unit = type.getCompilationUnit();
-            if ( unit == null )
+            TypeSource source = TypeSource.of( type );
+            if ( source == null && !type.isBinary() )
             {
+                // Source that should be there and is not: a compilation unit with no readable buffer.
+                // A binary type needs none - its members come out of the class file below.
                 return ClassOutlineResponse.failed( fullyQualifiedClassName, ClassOutlineResponse.Status.NO_SOURCE,
-                        "Type '" + fullyQualifiedClassName + "' has no attached source. Use getSource, which decompiles." );
+                        "Type '" + fullyQualifiedClassName + "' has no readable source." );
             }
 
-            IResource resource = unit.getResource();
+            IResource resource = source == null ? null : source.file();
             if ( resource != null && aiIgnoreService.isExcluded( resource ) )
             {
                 return ClassOutlineResponse.failed( fullyQualifiedClassName, ClassOutlineResponse.Status.ACCESS_DENIED,
@@ -659,34 +705,54 @@ public class CodeAnalysisService
             }
 
             // The platform's line tracker, so a CRLF file reports the same lines as an LF one.
-            IDocument document = new Document( unit.getBuffer().getContents() );
+            // Empty for a binary type with no source: JDT reads its members from the class file and
+            // reports no source range for any of them, so every member comes back with a zero range.
+            IDocument document = new Document( source == null ? "" : source.contents() );
+
+            // With no source there are no comments to read, so the classpath's Javadoc location is the
+            // only documentation there is and is worth the lookup. Where source was read the comments
+            // came with it, and the lookup - which may be a URL, once per member - would buy nothing.
+            boolean useAttachedJavadoc = source == null;
 
             List<ClassOutlineResponse.Member> fields = new ArrayList<>();
             if ( includeFields )
             {
                 for ( IField field : type.getFields() )
                 {
-                    fields.add( toMember( document, field, formatFieldDeclaration( field ), javadoc ) );
+                    if ( existsOnlyInTheClassFile( field ) )
+                    {
+                        continue;
+                    }
+                    fields.add( toMember( document, field, formatFieldDeclaration( field ), javadoc,
+                            useAttachedJavadoc ) );
                 }
             }
 
             List<ClassOutlineResponse.Member> methods = new ArrayList<>();
             for ( IMethod method : type.getMethods() )
             {
-                methods.add( toMember( document, method, formatMethodSignature( method ), javadoc ) );
+                if ( existsOnlyInTheClassFile( method ) )
+                {
+                    continue;
+                }
+                methods.add( toMember( document, method, formatMethodSignature( method ), javadoc,
+                        useAttachedJavadoc ) );
             }
 
             List<ClassOutlineResponse.Member> innerTypes = new ArrayList<>();
             for ( IType innerType : type.getTypes() )
             {
-                innerTypes.add( toMember( document, innerType, formatTypeDeclaration( innerType ), javadoc ) );
+                innerTypes.add( toMember( document, innerType, formatTypeDeclaration( innerType ), javadoc,
+                        useAttachedJavadoc ) );
             }
 
-            ClassOutlineResponse.Member declaration = toMember( document, type, formatTypeDeclaration( type ), javadoc );
+            ClassOutlineResponse.Member declaration =
+                    toMember( document, type, formatTypeDeclaration( type ), javadoc, useAttachedJavadoc );
 
             return ClassOutlineResponse.of( fullyQualifiedClassName,
                     resource == null ? null : resource.getProject().getName(),
                     resource == null ? null : resource.getProjectRelativePath().toString(),
+                    source == null ? SourceOrigin.DECOMPILED_CLASS : source.origin(),
                     declaration, fields, methods, innerTypes );
         }
         catch ( Exception e )
@@ -697,15 +763,46 @@ public class CodeAnalysisService
         }
     }
 
-    /** Both line numbers are 1-based and inclusive, as the reading tools take them. */
-    /** An outline is workspace source, so the attached-Javadoc lookup never applies. */
+    /**
+     * Whether a method is one the compiler put in the class file and no caller can name.
+     * <p>
+     * A class file lists the static initialiser and the bridge and synthetic methods generics
+     * require, and JDT reports them among a type's methods like any other. None of them can be
+     * called from source, so an outline carrying them would be describing the compiler's output
+     * rather than the type's API. The constructor generated for a class that declares none is
+     * not among them - that one is callable, and stays.
+     * <p>
+     * Fields as well as methods: an enum's class file carries a synthetic {@code $VALUES} array
+     * beside the {@code $values()} that fills it.
+     */
+    private static boolean existsOnlyInTheClassFile( IMember member ) throws JavaModelException
+    {
+        return "<clinit>".equals( member.getElementName() ) || Flags.isSynthetic( member.getFlags() );
+    }
+
+    /**
+     * Both line numbers are 1-based and inclusive, as the reading tools take them, and 0
+     * when the member has no source to point at.
+     * <p>
+     * A binary type carries members the attached source does not - the constructor the
+     * compiler generated for a class that declares none, bridge and synthetic methods -
+     * and JDT reports those with no source range at all. They are listed, with a zero
+     * range, rather than dropped: a member that vanished from an outline would read as a
+     * member the type does not have.
+     * <p>
+     * An outline built from source carries the comments in that text, so the attached-Javadoc
+     * lookup - which may reach for a URL - is asked for only where there is no source at all.
+     */
     private static ClassOutlineResponse.Member toMember( IDocument document, IMember member, String label,
-            Javadocs.Detail javadoc ) throws JavaModelException, BadLocationException
+            Javadocs.Detail javadoc, boolean useAttachedJavadoc ) throws JavaModelException, BadLocationException
     {
         ISourceRange range = member.getSourceRange();
-        int startLine = document.getLineOfOffset( range.getOffset() ) + 1;
-        int endLine = document.getLineOfOffset( range.getOffset() + Math.max( range.getLength() - 1, 0 ) ) + 1;
-        Javadocs.Rendered rendered = Javadocs.render( member, javadoc, false );
+        boolean mapped = SourceRange.isAvailable( range );
+        int startLine = mapped ? document.getLineOfOffset( range.getOffset() ) + 1 : 0;
+        int endLine = mapped
+                ? document.getLineOfOffset( range.getOffset() + Math.max( range.getLength() - 1, 0 ) ) + 1
+                : 0;
+        Javadocs.Rendered rendered = Javadocs.render( member, javadoc, useAttachedJavadoc );
         return new ClassOutlineResponse.Member( member.getElementName(), label, startLine, endLine,
                 rendered == null ? null : rendered.markdown(), rendered != null && rendered.inherited() );
     }
@@ -720,6 +817,12 @@ public class CodeAnalysisService
         {
             // JDT reports every interface as abstract; printing it back adds nothing.
             flags &= ~Flags.AccAbstract;
+        }
+        if ( type.isEnum() || type.isRecord() )
+        {
+            // An enum is final, or abstract when a constant has a body, and a record is always final.
+            // None of that is written in source, so none of it belongs in a declaration read back from one.
+            flags &= ~( Flags.AccFinal | Flags.AccAbstract );
         }
         appendModifiers( declaration, flags );
 
@@ -766,7 +869,7 @@ public class CodeAnalysisService
         }
 
         String superclass = type.getSuperclassName();
-        if ( superclass != null && !"Object".equals( superclass ) )
+        if ( superclass != null && !isImplicitSuperclass( type, superclass ) )
         {
             declaration.append( " extends " ).append( superclass );
         }
@@ -808,11 +911,38 @@ public class CodeAnalysisService
         return declaration.toString();
     }
 
+    /**
+     * Whether a superclass is the one the language gives the type anyway.
+     * <p>
+     * Source never writes these and a class file always does, so an outline that printed them would
+     * read differently for the same type depending on whether its source happened to be attached. A
+     * source type names it {@code Object} and a binary one {@code java.lang.Object}; an enum's is
+     * {@code java.lang.Enum}, carrying its own type argument when the class file spells the generic out.
+     */
+    private static boolean isImplicitSuperclass( IType type, String superclass ) throws JavaModelException
+    {
+        if ( "Object".equals( superclass ) || "java.lang.Object".equals( superclass ) )
+        {
+            return true;
+        }
+        if ( type.isEnum() )
+        {
+            return superclass.equals( "Enum" ) || superclass.startsWith( "java.lang.Enum" );
+        }
+        if ( type.isRecord() )
+        {
+            return superclass.equals( "Record" ) || superclass.equals( "java.lang.Record" );
+        }
+        return false;
+    }
+
     static String formatMethodSignature( IMethod method ) throws JavaModelException
     {
         StringBuilder signature = new StringBuilder();
         appendAnnotations( signature, method.getAnnotations() );
-        appendModifiers( signature, method.getFlags() );
+        // A varargs method carries the bit that means "transient" on a field, and Flags.toString prints
+        // it as such; the varargs itself belongs in the parameter list, which is where it is rendered.
+        appendModifiers( signature, method.getFlags() & ~Flags.AccVarargs );
 
         if ( !method.isConstructor() )
         {
@@ -855,13 +985,19 @@ public class CodeAnalysisService
 
         String[] parameterTypes = method.getParameterTypes();
         String[] parameterNames = method.getParameterNames();
+        boolean varargs = Flags.isVarargs( method.getFlags() );
         for ( int i = 0; i < parameterTypes.length; i++ )
         {
             if ( i > 0 )
             {
                 parameters.append( ", " );
             }
-            parameters.append( Signature.toString( parameterTypes[i] ) );
+            String parameterType = Signature.toString( parameterTypes[i] );
+            if ( varargs && i == parameterTypes.length - 1 && parameterType.endsWith( "[]" ) )
+            {
+                parameterType = parameterType.substring( 0, parameterType.length() - 2 ) + "...";
+            }
+            parameters.append( parameterType );
             if ( i < parameterNames.length )
             {
                 parameters.append( " " ).append( parameterNames[i] );
